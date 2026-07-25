@@ -81,9 +81,9 @@ pub use ttl::{ADMIN_ROTATION_MIN_DELAY_LEDGERS, PENDING_MIGRATION_TTL_LEDGERS};
 // `DisputeResolution` and `DisputeSplit` are defined once in `types.rs` and
 // re-exported here; `dispute.rs` uses them via `crate::DisputeResolution`.
 pub use types::{
-    Contract, ContractBounds, ContractStatus, ContractSummary, DataKey, DepositMode,
-    DisputeResolution, DisputeSplit, Error, GovernedParameters, Milestone, MilestoneApprovals,
-    MilestoneEntry, MilestoneSummary, PendingAdminProposal, ReadinessChecklist,
+    BatchContractResult, Contract, ContractBounds, ContractItem, ContractStatus, ContractSummary,
+    DataKey, DepositMode, DisputeResolution, DisputeSplit, Error, GovernedParameters, Milestone,
+    MilestoneApprovals, MilestoneEntry, MilestoneSummary, PendingAdminProposal, ReadinessChecklist,
     ReleaseAuthorization, Reputation, SplitAmounts, CONTRACT_SUMMARY_SCHEMA_VERSION,
 };
 
@@ -108,6 +108,15 @@ pub const MAX_MAX_MILESTONES: u32 = 100;
 /// Absolute minimum for the max escrow stroops setting (0.01 XLM).
 pub const MIN_MAX_ESCROW_STROOPS: i128 = 1_000_000;
 
+/// Maximum amount allowed for a single milestone (in stroops).
+pub const MAX_SINGLE_AMOUNT_STROOPS: i128 = 1_000_000_000_000_000;
+
+/// Maximum number of items in a paginated view page.
+pub const PAGE_CEILING: u32 = 50;
+
+/// Maximum number of contracts allowed in a single batch creation call.
+pub const BATCH_CAP: u32 = 10;
+
 pub const MAINNET_PROTOCOL_VERSION: u32 = 1u32;
 pub const MAINNET_MAX_TOTAL_ESCROW_PER_CONTRACT_STROOPS: i128 = 1_000_000_000_000_000i128;
 
@@ -125,14 +134,6 @@ pub struct EscrowContractData {
     pub released_amount: i128,
     pub refunded_amount: i128,
     pub reputation_issued: bool,
-}
-
-#[soroban_sdk::contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MilestoneApprovals {
-    pub client_approved: bool,
-    pub freelancer_approved: bool,
-    pub arbiter_approved: bool,
 }
 
 #[soroban_sdk::contracttype]
@@ -244,6 +245,12 @@ pub enum EscrowError {
     EmptyComment = 42,
     /// Reputation feedback comment exceeded the 200-character maximum.
     CommentTooLong = 43,
+    /// The batch size exceeds the maximum allowed contracts per batch.
+    BatchExceedsCap = 44,
+    /// The provided limit value is out of the allowed range.
+    LimitOutOfRange = 45,
+    /// The contract ID is invalid (e.g. zero).
+    InvalidContractId = 46,
 }
 
 impl Escrow {
@@ -257,6 +264,13 @@ impl Escrow {
         env.storage()
             .persistent()
             .set(&DataKey::SettlementToken, token);
+    }
+
+    /// Validate that a contract ID is within acceptable bounds.
+    pub(crate) fn validate_contract_id_bounds(env: &Env, contract_id: u32) {
+        if contract_id == 0 {
+            env.panic_with_error(Error::InvalidContractId);
+        }
     }
 }
 
@@ -522,7 +536,7 @@ impl Escrow {
     /// Activating the emergency pause to flip the `emergency_controls_enabled` flag leaves the contract
     /// in a paused state. To complete a clean deploy and allow normal operations, the operator must
     /// subsequently call `resolve_emergency` to unpause the contract.
-    pub fn get_mainnet_readiness_info(env: Env) -> ReadinessChecklist {
+    pub fn get_readiness_checklist(env: Env) -> ReadinessChecklist {
         env.storage()
             .persistent()
             .get(&DataKey::ReadinessChecklist)
@@ -1906,14 +1920,9 @@ impl Escrow {
 
     // ─── Contract lifecycle ───────────────────────────────────────────────────
 
-    /// Create a new escrow contract. Blocked when paused.
-    pub fn create_contract(
-        env: Env,
-        client: Address,
-        freelancer: Address,
-        milestone_amounts: Vec<i128>,
-    ) -> u32 {
+    pub fn cancel_contract(env: Env, contract_id: u32, client: Address) -> bool {
         Self::require_not_paused(&env);
+        Self::validate_contract_id_bounds(&env, contract_id);
         let mut contract: Contract = env
             .storage()
             .persistent()
@@ -1941,12 +1950,9 @@ impl Escrow {
 
         client.require_auth();
 
-        let refund_amount = crate::checked_available_balance(
-            contract.funded_amount,
-            contract.released_amount,
-            contract.refunded_amount,
-        )
-        .unwrap_or_else(|e| env.panic_with_error(e));
+        let old_status = contract.status;
+        let refund_amount =
+            contract.funded_amount - contract.released_amount - contract.refunded_amount;
         if refund_amount > 0 {
             let token = Self::read_settlement_token(&env)
                 .unwrap_or_else(|| env.panic_with_error(EscrowError::NotInitialized));
@@ -1957,19 +1963,11 @@ impl Escrow {
             );
         }
 
-        let mut total: i128 = 0;
-        for i in 0..milestone_amounts.len() {
-            let amt = milestone_amounts.get(i).unwrap();
-            if amt <= 0 {
-                env.panic_with_error(EscrowError::InvalidMilestoneAmount);
-            }
-            total = safe_add_amounts(total, amt)
-                .unwrap_or_else(|| env.panic_with_error(EscrowError::PotentialOverflow));
-        }
-        let max_escrow = Self::effective_max_escrow_stroops(&env);
-        if total > max_escrow {
-            env.panic_with_error(EscrowError::InvalidMilestoneAmount);
-        }
+        contract.refunded_amount = contract
+            .refunded_amount
+            .checked_add(refund_amount)
+            .unwrap_or_else(|| env.panic_with_error(EscrowError::InsufficientFunds));
+        contract.status = ContractStatus::Cancelled;
 
         env.storage()
             .persistent()
