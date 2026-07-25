@@ -281,7 +281,6 @@ pub fn accumulate_amounts<I: IntoIterator<Item = i128>>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EscrowError;
 
     #[test]
     fn test_validate_single_amount() {
@@ -437,36 +436,347 @@ mod tests {
         assert_eq!(safe_subtract_amounts(i128::MIN, 1), None);
     }
 
+    // ── Overflow / saturation boundary tests ────────────────────────────────
+
     #[test]
-    fn test_checked_available_balance_extremes() {
-        // Ordinary case.
-        assert_eq!(checked_available_balance(100, 20, 10), Ok(70));
-
-        // Subtraction near zero: released + refunded exactly consume funded.
-        assert_eq!(checked_available_balance(100, 60, 40), Ok(0));
-
-        // One stroop of headroom left.
-        assert_eq!(checked_available_balance(100, 60, 39), Ok(1));
-
-        // i128::MAX extremes: funded at the ceiling, nothing released/refunded yet.
-        assert_eq!(checked_available_balance(i128::MAX, 0, 0), Ok(i128::MAX));
-        assert_eq!(checked_available_balance(i128::MAX, i128::MAX, 0), Ok(0));
-
-        // Corrupted state: released + refunded exceed funded by one stroop.
+    fn validate_single_amount_rejects_i128_max_exceeds_bounds() {
         assert_eq!(
-            checked_available_balance(100, 60, 41),
-            Err(crate::Error::AccountingInvariantViolated)
+            validate_single_amount(i128::MAX),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
         );
+    }
 
-        // Underflow at the i128::MIN boundary is reported the same way as an
-        // ordinary invariant violation, not a silent wraparound.
+    #[test]
+    fn validate_single_amount_rejects_i128_min() {
         assert_eq!(
-            checked_available_balance(i128::MIN, 1, 0),
-            Err(crate::Error::AccountingInvariantViolated)
+            validate_single_amount(i128::MIN),
+            Err(crate::EscrowError::AmountMustBePositive)
         );
+    }
+
+    #[test]
+    fn validate_single_amount_rejects_i128_min_plus_one() {
         assert_eq!(
-            checked_available_balance(0, i128::MIN, 1),
-            Err(crate::Error::AccountingInvariantViolated)
+            validate_single_amount(i128::MIN + 1),
+            Err(crate::EscrowError::AmountMustBePositive)
         );
+    }
+
+    #[test]
+    fn validate_single_amount_boundary_one() {
+        assert!(validate_single_amount(1).is_ok());
+    }
+
+    #[test]
+    fn validate_single_amount_just_below_max() {
+        assert!(validate_single_amount(MAX_SINGLE_AMOUNT_STROOPS - 1).is_ok());
+    }
+
+    #[test]
+    fn validate_single_amount_exactly_at_max() {
+        assert!(validate_single_amount(MAX_SINGLE_AMOUNT_STROOPS).is_ok());
+    }
+
+    // ── Amount array overflow ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_amount_array_sum_overflow_returns_error() {
+        let amounts = [i128::MAX, i128::MAX];
+        assert_eq!(
+            validate_amount_array(&amounts),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_amount_array_sum_near_i128_max() {
+        let half = i128::MAX / 2;
+        let remainder = i128::MAX - half;
+        let amounts = [half, remainder];
+        assert_eq!(
+            validate_amount_array(&amounts),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_amount_array_sum_one_over_i128_max() {
+        let half = i128::MAX / 2;
+        let amounts = [half, half + 1];
+        assert_eq!(
+            validate_amount_array(&amounts),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_amount_array_single_max_amount() {
+        let amounts = [MAX_SINGLE_AMOUNT_STROOPS];
+        assert_eq!(
+            validate_amount_array(&amounts),
+            Ok(MAX_SINGLE_AMOUNT_STROOPS)
+        );
+    }
+
+    #[test]
+    fn validate_amount_array_empty() {
+        let amounts: [i128; 0] = [];
+        assert_eq!(validate_amount_array(&amounts), Ok(0));
+    }
+
+    #[test]
+    fn validate_amount_array_many_small_values_sum_to_max() {
+        let per = MAX_SINGLE_AMOUNT_STROOPS / 100;
+        let amounts: [i128; 100] = [per; 100];
+        assert_eq!(validate_amount_array(&amounts), Ok(per * 100));
+    }
+
+    // ── Deposit amount overflow ────────────────────────────────────────────
+
+    #[test]
+    fn validate_deposit_amount_i128_max_current_plus_one() {
+        assert_eq!(
+            validate_deposit_amount(1, i128::MAX, i128::MAX),
+            Err(crate::EscrowError::PotentialOverflow)
+        );
+    }
+
+    #[test]
+    fn validate_deposit_amount_two_large_values_overflow() {
+        let a = i128::MAX / 2 + 1;
+        let b = i128::MAX / 2 + 1;
+        assert_eq!(
+            validate_deposit_amount(a, b, i128::MAX),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_deposit_amount_exact_i128_max_current() {
+        assert_eq!(
+            validate_deposit_amount(i128::MAX, i128::MAX, i128::MAX),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_deposit_amount_zero_current() {
+        assert!(validate_deposit_amount(100, 0, 200).is_ok());
+    }
+
+    #[test]
+    fn validate_deposit_amount_sum_exceeds_max() {
+        assert_eq!(
+            validate_deposit_amount(600, 500, 1000),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_deposit_amount_exactly_fills_capacity() {
+        assert!(validate_deposit_amount(500, 500, 1000).is_ok());
+    }
+
+    #[test]
+    fn validate_deposit_amount_one_stroop_over() {
+        assert_eq!(
+            validate_deposit_amount(501, 500, 1000),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    // ── safe_add_amounts / safe_subtract_amounts boundary tests ────────────
+
+    #[test]
+    fn safe_add_two_i128_max() {
+        assert_eq!(safe_add_amounts(i128::MAX, i128::MAX), None);
+    }
+
+    #[test]
+    fn safe_add_i128_max_and_zero() {
+        assert_eq!(safe_add_amounts(i128::MAX, 0), Some(i128::MAX));
+    }
+
+    #[test]
+    fn safe_add_i128_min_and_zero() {
+        assert_eq!(safe_add_amounts(i128::MIN, 0), Some(i128::MIN));
+    }
+
+    #[test]
+    fn safe_add_i128_min_and_negative_one() {
+        assert_eq!(safe_add_amounts(i128::MIN, -1), None);
+    }
+
+    #[test]
+    fn safe_add_i128_max_and_one() {
+        assert_eq!(safe_add_amounts(i128::MAX, 1), None);
+    }
+
+    #[test]
+    fn safe_add_negative_values() {
+        assert_eq!(safe_add_amounts(-100, -200), Some(-300));
+    }
+
+    #[test]
+    fn safe_subtract_i128_min_and_one() {
+        assert_eq!(safe_subtract_amounts(i128::MIN, 1), None);
+    }
+
+    #[test]
+    fn safe_subtract_i128_max_and_negative_one() {
+        assert_eq!(safe_subtract_amounts(i128::MAX, -1), None);
+    }
+
+    #[test]
+    fn safe_subtract_zero_and_i128_max() {
+        assert_eq!(safe_subtract_amounts(0, i128::MAX), Some(i128::MIN + 1));
+    }
+
+    #[test]
+    fn safe_subtract_same_value_returns_zero() {
+        assert_eq!(safe_subtract_amounts(12345, 12345), Some(0));
+    }
+
+    #[test]
+    fn safe_subtract_zero_and_zero() {
+        assert_eq!(safe_subtract_amounts(0, 0), Some(0));
+    }
+
+    #[test]
+    fn safe_subtract_i128_max_and_zero() {
+        assert_eq!(safe_subtract_amounts(i128::MAX, 0), Some(i128::MAX));
+    }
+
+    #[test]
+    fn safe_subtract_i128_min_and_zero() {
+        assert_eq!(safe_subtract_amounts(i128::MIN, 0), Some(i128::MIN));
+    }
+
+    // ── accumulate_amounts boundary tests ──────────────────────────────────
+
+    #[test]
+    fn accumulate_amounts_empty() {
+        assert_eq!(accumulate_amounts([]), Ok(0));
+    }
+
+    #[test]
+    fn accumulate_amounts_overflow() {
+        assert_eq!(
+            accumulate_amounts([i128::MAX, 1]),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn accumulate_amounts_rejects_negative() {
+        assert_eq!(
+            accumulate_amounts([-1]),
+            Err(crate::EscrowError::AmountMustBePositive)
+        );
+    }
+
+    #[test]
+    fn accumulate_amounts_rejects_zero() {
+        assert_eq!(
+            accumulate_amounts([0]),
+            Err(crate::EscrowError::AmountMustBePositive)
+        );
+    }
+
+    #[test]
+    fn accumulate_amounts_rejects_overbound() {
+        assert_eq!(
+            accumulate_amounts([MAX_SINGLE_AMOUNT_STROOPS + 1]),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn accumulate_amounts_near_max() {
+        let half = MAX_SINGLE_AMOUNT_STROOPS / 2;
+        let remainder = MAX_SINGLE_AMOUNT_STROOPS - half;
+        assert_eq!(
+            accumulate_amounts([half, remainder]),
+            Ok(MAX_SINGLE_AMOUNT_STROOPS)
+        );
+    }
+
+    // ── validate_contract_total boundary tests ─────────────────────────────
+
+    #[test]
+    fn validate_contract_total_at_zero() {
+        assert!(validate_contract_total(0, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_contract_total_exceeds_max() {
+        assert_eq!(
+            validate_contract_total(101, 100),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_contract_total_exactly_at_max() {
+        assert!(validate_contract_total(100, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_contract_total_one_under_max() {
+        assert!(validate_contract_total(99, 100).is_ok());
+    }
+
+    #[test]
+    fn validate_contract_total_i128_max_exceeds_zero() {
+        assert_eq!(
+            validate_contract_total(i128::MAX, 0),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_contract_total_both_i128_max() {
+        assert!(validate_contract_total(i128::MAX, i128::MAX).is_ok());
+    }
+
+    // ── validate_milestone_amounts boundary tests ──────────────────────────
+
+    #[test]
+    fn validate_milestone_amounts_overflow_in_sum() {
+        assert_eq!(
+            validate_milestone_amounts(&[i128::MAX, 1], i128::MAX),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_milestone_amounts_empty_array() {
+        assert_eq!(validate_milestone_amounts(&[], 100), Ok(0));
+    }
+
+    #[test]
+    fn validate_milestone_amounts_total_exceeds_contract_max() {
+        assert_eq!(
+            validate_milestone_amounts(&[60, 60], 100),
+            Err(crate::EscrowError::InvalidMilestoneAmount)
+        );
+    }
+
+    #[test]
+    fn validate_milestone_amounts_total_exactly_at_max() {
+        assert_eq!(validate_milestone_amounts(&[50, 50], 100), Ok(100));
+    }
+
+    #[test]
+    fn validate_milestone_amounts_rejects_negative_element() {
+        assert_eq!(
+            validate_milestone_amounts(&[100, -1], 200),
+            Err(crate::EscrowError::AmountMustBePositive)
+        );
+    }
+
+    #[test]
+    fn validate_milestone_amounts_single_element() {
+        assert_eq!(validate_milestone_amounts(&[42], 100), Ok(42));
     }
 }
