@@ -93,6 +93,10 @@ pub enum DataKey {
     ReputationComment(u32),
     // Client migration
     PendingClientMigration(u32),
+    // Settlement token
+    SettlementToken,
+    // Finalization
+    Finalization(u32),
     // Protocol / governance
     GovernanceAdmin,
     PendingGovernanceAdmin,
@@ -342,6 +346,29 @@ pub struct Reputation {
 }
 
 // ── Dispute Resolution ───────────────────────────────────────────────────────
+
+/// A single contract creation request within a batch.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ContractItem {
+    pub client: Address,
+    pub freelancer: Address,
+    pub arbiter: Option<Address>,
+    pub milestones: Vec<i128>,
+    pub release_authorization: ReleaseAuthorization,
+}
+
+/// The result for a single item in a batch creation call.
+///
+/// On success, `contract_id` holds the assigned ID. On failure, `error_code`
+/// holds the Soroban error code that would have been raised.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchContractResult {
+    pub index: u32,
+    pub contract_id: Option<u32>,
+    pub error_code: Option<u32>,
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
